@@ -4,10 +4,11 @@ use darling::util::{Flag, Override};
 use proc_macro::TokenStream;
 use quote::{ToTokens, TokenStreamExt, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
     Attribute, Expr, ExprLit, Field, Fields, Ident, Item, ItemEnum, ItemStruct, Lit, LitStr, Meta,
-    MetaNameValue, Path, Type, parse_macro_input, parse_quote,
+    MetaNameValue, Path, Token, Type, Variant, parse_macro_input, parse_quote,
 };
 
 const ERR_NOT_STRUCT_OR_ENUM: &str = "Settings should be either structure or enum.";
@@ -127,13 +128,12 @@ fn expand_enum(options: Options, item: &mut ItemEnum) -> Result<proc_macro2::Tok
     item.attrs
         .push(parse_quote!(#[serde(rename_all = "snake_case")]));
 
-    let ident = item.ident.clone();
-    let crate_path = options.crate_path;
+    let impl_settings = impl_settings_trait_for_enum(&options, item);
 
     Ok(quote! {
         #item
 
-        impl #crate_path::settings::Settings for #ident { }
+        #impl_settings
     })
 }
 
@@ -295,6 +295,96 @@ fn impl_settings_trait_for_field(
     impl_for_field
 }
 
+fn impl_settings_trait_for_enum(options: &Options, item: &ItemEnum) -> proc_macro2::TokenStream {
+    let ident = item.ident.clone();
+    let crate_path = &options.crate_path;
+
+    // Nothing under a variant can be documented, so keep the default no-op `add_docs`.
+    if !item.variants.iter().any(is_documented_variant) {
+        return quote! {
+            impl #crate_path::settings::Settings for #ident { }
+        };
+    }
+
+    let mut doc_comments_impl = quote! {};
+
+    for variant in &item.variants {
+        doc_comments_impl.append_all(impl_settings_trait_for_variant(options, variant));
+    }
+
+    quote! {
+        impl #crate_path::settings::Settings for #ident {
+            fn add_docs(
+                &self,
+                parent_key: &[String],
+                docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
+            {
+                match self {
+                    #doc_comments_impl
+                }
+            }
+        }
+    }
+}
+
+/// Returns whether a variant gets a key of its own in the serialized settings.
+///
+/// A unit variant serializes as a bare value, so there is no line to document. A skipped
+/// variant never reaches the config at all, and the type it wraps doesn't have to implement
+/// [`Settings`].
+fn is_documented_variant(variant: &Variant) -> bool {
+    matches!(variant.fields, Fields::Unnamed(_)) && !is_serde_skipped(&variant.attrs)
+}
+
+fn impl_settings_trait_for_variant(
+    options: &Options,
+    variant: &Variant,
+) -> proc_macro2::TokenStream {
+    let ident = &variant.ident;
+    let span = variant.fields.span();
+
+    let cfg_attrs = variant
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg"))
+        .collect::<Vec<_>>();
+
+    if !is_documented_variant(variant) {
+        let pattern = match variant.fields {
+            Fields::Unnamed(_) => quote_spanned! { span=> Self::#ident(..) },
+            _ => quote_spanned! { span=> Self::#ident },
+        };
+
+        return quote! {
+            #(#cfg_attrs)*
+            #pattern => {}
+        };
+    }
+
+    let crate_path = &options.crate_path;
+    let key_str = serde_variant_name(variant);
+    let docs = extract_doc_comments(&variant.attrs);
+
+    let mut impl_for_variant = quote_spanned! { span=>
+        let mut key = parent_key.to_vec();
+        key.push(#key_str.into());
+        #crate_path::settings::Settings::add_docs(value, &key, docs);
+    };
+
+    if !docs.is_empty() {
+        impl_for_variant.append_all(quote! {
+            docs.insert(key, &[#(#docs,)*][..]);
+        });
+    }
+
+    quote_spanned! { span=>
+        #(#cfg_attrs)*
+        Self::#ident(value) => {
+            #impl_for_variant
+        }
+    }
+}
+
 fn extract_doc_comments(attrs: &[Attribute]) -> Vec<LitStr> {
     let mut comments = vec![];
 
@@ -349,6 +439,87 @@ fn is_serde_flattened(attrs: &[Attribute]) -> bool {
         SerdeArgs::parse_from_attrs(attrs),
         Ok(Some(args)) if args.flatten.is_present(),
     )
+}
+
+/// Returns the arguments of every `serde` attribute in `attrs`, including the ones written as
+/// `cfg_attr(<predicate>, serde(...))`, which reach an attribute macro unexpanded.
+fn serde_args(attrs: &[Attribute]) -> Vec<Meta> {
+    let mut args = Vec::new();
+
+    for attr in attrs {
+        let meta = if attr.path().is_ident("serde") {
+            attr.meta.clone()
+        } else if attr.path().is_ident("cfg_attr") {
+            let Ok(nested) = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            else {
+                continue;
+            };
+
+            // The first argument is the `cfg` predicate, the rest are the attributes it guards.
+            let Some(meta) = nested
+                .into_iter()
+                .skip(1)
+                .find(|meta| meta.path().is_ident("serde"))
+            else {
+                continue;
+            };
+
+            meta
+        } else {
+            continue;
+        };
+
+        let Meta::List(list) = meta else {
+            continue;
+        };
+
+        if let Ok(nested) = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) {
+            args.extend(nested);
+        }
+    }
+
+    args
+}
+
+/// Returns whether `attrs` contains `serde(skip)`.
+fn is_serde_skipped(attrs: &[Attribute]) -> bool {
+    serde_args(attrs)
+        .iter()
+        .any(|arg| arg.path().is_ident("skip"))
+}
+
+/// Returns the key an enum variant serializes under.
+fn serde_variant_name(variant: &Variant) -> String {
+    for arg in serde_args(&variant.attrs) {
+        if let Meta::NameValue(MetaNameValue {
+            path,
+            value:
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(name),
+                    ..
+                }),
+            ..
+        }) = &arg
+            && path.is_ident("rename")
+        {
+            return name.value();
+        }
+    }
+
+    // `expand_enum` puts `serde(rename_all = "snake_case")` on every settings enum, so an
+    // un-renamed variant serializes under the snake case of its identifier.
+    let ident = variant.ident.to_string();
+    let mut name = String::with_capacity(ident.len());
+
+    for (index, character) in ident.char_indices() {
+        if index > 0 && character.is_uppercase() {
+            name.push('_');
+        }
+
+        name.push(character.to_ascii_lowercase());
+    }
+
+    name
 }
 
 fn impl_serde_aware_default(item: &ItemStruct) -> Result<proc_macro2::TokenStream> {
@@ -904,7 +1075,22 @@ mod tests {
                 NewTypeVariant(String)
             }
 
-            impl ::foundations::settings::Settings for TestEnum { }
+            impl ::foundations::settings::Settings for TestEnum {
+                fn add_docs(
+                    &self,
+                    parent_key: &[String],
+                    docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
+                {
+                    match self {
+                        Self::UnitVariant => {}
+                        Self::NewTypeVariant(value) => {
+                            let mut key = parent_key.to_vec();
+                            key.push("new_type_variant".into());
+                            ::foundations::settings::Settings::add_docs(value, &key, docs);
+                        }
+                    }
+                }
+            }
         };
 
         assert_eq!(actual, expected);
@@ -940,7 +1126,22 @@ mod tests {
                 NewTypeVariant(String)
             }
 
-            impl ::foundations::settings::Settings for TestEnum { }
+            impl ::foundations::settings::Settings for TestEnum {
+                fn add_docs(
+                    &self,
+                    parent_key: &[String],
+                    docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
+                {
+                    match self {
+                        Self::UnitVariant => {}
+                        Self::NewTypeVariant(value) => {
+                            let mut key = parent_key.to_vec();
+                            key.push("new_type_variant".into());
+                            ::foundations::settings::Settings::add_docs(value, &key, docs);
+                        }
+                    }
+                }
+            }
         };
 
         assert_eq!(actual, expected);
@@ -978,7 +1179,97 @@ mod tests {
                 NewTypeVariant(String)
             }
 
-            impl ::foundations::settings::Settings for TestEnum { }
+            impl ::foundations::settings::Settings for TestEnum {
+                fn add_docs(
+                    &self,
+                    parent_key: &[String],
+                    docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
+                {
+                    match self {
+                        Self::UnitVariant => {}
+                        Self::NewTypeVariant(value) => {
+                            let mut key = parent_key.to_vec();
+                            key.push("new_type_variant".into());
+                            ::foundations::settings::Settings::add_docs(value, &key, docs);
+                        }
+                    }
+                }
+            }
+        };
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn expand_enum_with_variant_docs() {
+        let options = parse_attr! {
+            #[settings(impl_default = false)]
+        };
+
+        let src = parse_quote! {
+            enum TestEnum {
+                /// Nested settings.
+                Nested(NestedStruct),
+                /// Renamed variant.
+                #[serde(rename = "RENAMED")]
+                Renamed(NestedStruct),
+                /// Not serialized.
+                #[serde(skip)]
+                Skipped(NotSettings),
+                /// A unit variant.
+                UnitVariant
+            }
+        };
+
+        let actual = expand_from_parsed(options, src).unwrap().to_string();
+
+        let expected = code_str! {
+            #[derive(
+                Clone,
+                ::foundations::reexports_for_macros::serde::Serialize,
+                ::foundations::reexports_for_macros::serde::Deserialize,
+            )]
+            #[derive(Debug)]
+            #[serde(crate = ":: foundations :: reexports_for_macros :: serde")]
+            #[serde(deny_unknown_fields)]
+            #[serde(rename_all="snake_case")]
+            enum TestEnum {
+                #[doc = r" Nested settings."]
+                Nested(NestedStruct),
+                #[doc = r" Renamed variant."]
+                #[serde(rename = "RENAMED")]
+                Renamed(NestedStruct),
+                #[doc = r" Not serialized."]
+                #[serde(skip)]
+                Skipped(NotSettings),
+                #[doc = r" A unit variant."]
+                UnitVariant
+            }
+
+            impl ::foundations::settings::Settings for TestEnum {
+                fn add_docs(
+                    &self,
+                    parent_key: &[String],
+                    docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
+                {
+                    match self {
+                        Self::Nested(value) => {
+                            let mut key = parent_key.to_vec();
+                            key.push("nested".into());
+                            ::foundations::settings::Settings::add_docs(value, &key, docs);
+                            docs.insert(key, &[r" Nested settings.",][..]);
+                        }
+                        Self::Renamed(value) => {
+                            let mut key = parent_key.to_vec();
+                            key.push("RENAMED".into());
+                            ::foundations::settings::Settings::add_docs(value, &key, docs);
+                            docs.insert(key, &[r" Renamed variant.",][..]);
+                        }
+                        Self::Skipped(..) => {}
+                        Self::UnitVariant => {}
+                    }
+                }
+            }
         };
 
         assert_eq!(actual, expected);
