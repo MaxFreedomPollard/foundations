@@ -299,8 +299,12 @@ fn impl_settings_trait_for_enum(options: &Options, item: &ItemEnum) -> proc_macr
     let ident = item.ident.clone();
     let crate_path = &options.crate_path;
 
-    // Nothing under a variant can be documented, so keep the default no-op `add_docs`.
-    if !item.variants.iter().any(is_documented_variant) {
+    // Documenting a new type variant makes the type it wraps reachable through `add_docs`, so
+    // that type has to implement `Settings`. That is a new requirement on existing code, so it
+    // stays behind `--cfg foundations_unstable` until the next breaking release.
+    //
+    // Nothing under a variant can be documented otherwise, so keep the default no-op `add_docs`.
+    if !cfg!(foundations_unstable) || !item.variants.iter().any(is_documented_variant) {
         return quote! {
             impl #crate_path::settings::Settings for #ident { }
         };
@@ -564,6 +568,37 @@ mod tests {
     use super::*;
     use crate::common::test_utils::{code_str, parse_attr};
     use syn::parse_quote;
+
+    /// The `Settings` impl expected for an enum with a new type variant.
+    ///
+    /// Documenting a new type variant is behind `--cfg foundations_unstable`, see
+    /// `impl_settings_trait_for_enum`. Without it the enum keeps the default no-op `add_docs`.
+    fn test_enum_settings_impl() -> String {
+        if cfg!(foundations_unstable) {
+            code_str! {
+                impl ::foundations::settings::Settings for TestEnum {
+                    fn add_docs(
+                        &self,
+                        parent_key: &[String],
+                        docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
+                    {
+                        match self {
+                            Self::UnitVariant => {}
+                            Self::NewTypeVariant(value) => {
+                                let mut key = parent_key.to_vec();
+                                key.push("new_type_variant".into());
+                                ::foundations::settings::Settings::add_docs(value, &key, docs);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            code_str! {
+                impl ::foundations::settings::Settings for TestEnum { }
+            }
+        }
+    }
 
     #[test]
     fn expand_structure() {
@@ -1058,7 +1093,7 @@ mod tests {
 
         let actual = expand_from_parsed(options, src).unwrap().to_string();
 
-        let expected = code_str! {
+        let mut expected = code_str! {
             #[derive(Default)]
             #[derive(
                 Clone,
@@ -1074,24 +1109,9 @@ mod tests {
                 UnitVariant,
                 NewTypeVariant(String)
             }
-
-            impl ::foundations::settings::Settings for TestEnum {
-                fn add_docs(
-                    &self,
-                    parent_key: &[String],
-                    docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
-                {
-                    match self {
-                        Self::UnitVariant => {}
-                        Self::NewTypeVariant(value) => {
-                            let mut key = parent_key.to_vec();
-                            key.push("new_type_variant".into());
-                            ::foundations::settings::Settings::add_docs(value, &key, docs);
-                        }
-                    }
-                }
-            }
         };
+        expected.push(' ');
+        expected.push_str(&test_enum_settings_impl());
 
         assert_eq!(actual, expected);
     }
@@ -1111,7 +1131,7 @@ mod tests {
 
         let actual = expand_from_parsed(options, src).unwrap().to_string();
 
-        let expected = code_str! {
+        let mut expected = code_str! {
             #[derive(
                 Clone,
                 ::foundations::reexports_for_macros::serde::Serialize,
@@ -1125,24 +1145,9 @@ mod tests {
                 UnitVariant,
                 NewTypeVariant(String)
             }
-
-            impl ::foundations::settings::Settings for TestEnum {
-                fn add_docs(
-                    &self,
-                    parent_key: &[String],
-                    docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
-                {
-                    match self {
-                        Self::UnitVariant => {}
-                        Self::NewTypeVariant(value) => {
-                            let mut key = parent_key.to_vec();
-                            key.push("new_type_variant".into());
-                            ::foundations::settings::Settings::add_docs(value, &key, docs);
-                        }
-                    }
-                }
-            }
         };
+        expected.push(' ');
+        expected.push_str(&test_enum_settings_impl());
 
         assert_eq!(actual, expected);
     }
@@ -1163,7 +1168,7 @@ mod tests {
 
         let actual = expand_from_parsed(options, src).unwrap().to_string();
 
-        let expected = code_str! {
+        let mut expected = code_str! {
             #[derive(Default)]
             #[derive(
                 Clone,
@@ -1178,28 +1183,14 @@ mod tests {
                 UnitVariant,
                 NewTypeVariant(String)
             }
-
-            impl ::foundations::settings::Settings for TestEnum {
-                fn add_docs(
-                    &self,
-                    parent_key: &[String],
-                    docs: &mut ::std::collections::HashMap<Vec<String>, &'static [&'static str]>)
-                {
-                    match self {
-                        Self::UnitVariant => {}
-                        Self::NewTypeVariant(value) => {
-                            let mut key = parent_key.to_vec();
-                            key.push("new_type_variant".into());
-                            ::foundations::settings::Settings::add_docs(value, &key, docs);
-                        }
-                    }
-                }
-            }
         };
+        expected.push(' ');
+        expected.push_str(&test_enum_settings_impl());
 
         assert_eq!(actual, expected);
     }
 
+    #[cfg(foundations_unstable)]
     #[test]
     fn expand_enum_with_variant_docs() {
         let options = parse_attr! {
