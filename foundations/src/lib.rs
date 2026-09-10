@@ -51,7 +51,6 @@
 //! Foundations has unstable features which are gated behind `--cfg foundations_unstable`:
 //!
 //! - **tokio-runtime-metrics**: Enables runtime metrics for Tokio runtimes. Implicitly enables the **metrics** feature. [Also requires tokio_unstable](https://docs.rs/tokio/latest/tokio/#unstable-features).
-//! - **settings-new-type-variant-docs**: Documents the fields of a new type enum variant in generated settings. Requires the type the variant wraps to implement [`Settings`](crate::settings::Settings).
 //!
 //! To enable these, you must add `--cfg foundations_unstable` to your RUSTFLAGS environment variable.
 //!
